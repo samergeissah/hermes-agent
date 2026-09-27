@@ -615,8 +615,9 @@ External UIs can manage Hermes sessions over REST without standing up the dashbo
 | `POST` | `/api/sessions/{id}/fork` | Branch the session via `SessionDB` lineage (matches CLI `/branch` semantics) |
 | `POST` | `/api/sessions/{id}/chat` | Run one synchronous agent turn |
 | `POST` | `/api/sessions/{id}/chat/stream` | SSE wrapper over a single turn — emits `assistant.delta`, `assistant.commentary` (mid-turn commentary: `message_id`, `text`, `already_streamed`; never folded into `assistant.completed`), `tool.started`, `tool.completed`, `tool.failed` (a tool that finished with an error), then a terminal `run.completed` / `run.failed` / `run.cancelled` event that matches how the turn ended (see [Terminal run status](../../developer-guide/programmatic-integration.md#terminal-run-status)) |
+| `POST` | `/api/sessions/{id}/chat/attachments` | One image upload (`multipart/form-data`: `message`, `filename`, `mime_type`, `file`) as one synchronous agent turn; returns the same completion envelope as `/chat`. The bytes are sniffed (declared `mime_type` is advisory) and a non-image upload is refused with **415** `unsupported_media_type` |
 
-`/v1/capabilities` advertises the full surface via `session_*` feature flags and `endpoints.session_*` entries so external UIs can detect support and fall back safely. Inline images are supported in `chat` and `chat/stream` payloads (multimodal-aware path).
+`/v1/capabilities` advertises the full surface via `session_*` feature flags and `endpoints.session_*` entries so external UIs can detect support and fall back safely. Inline images are supported in `chat` and `chat/stream` payloads (multimodal-aware path), and `chat/attachments` accepts the same images as an upload. Every one of those image inputs is routed through `agent.image_input_mode` (`auto` | `native` | `text`) exactly like a messaging-lane attachment: `auto` with an explicit `auxiliary.vision` backend, or a model without vision, analyzes the image up-front on that backend and sends only the description to the main model.
 
 ```bash
 # fork a session and run one turn
@@ -829,7 +830,7 @@ In Open WebUI, add each as a separate connection. The model dropdown shows `alic
 ## Limitations
 
 - **Response storage** — stored responses (for `previous_response_id`) are persisted in SQLite and survive gateway restarts. Max 100 stored responses (LRU eviction).
-- **No file upload** — inline images are supported on both `/v1/chat/completions` and `/v1/responses`, but uploaded files (`file`, `input_file`, `file_id`) and non-image document inputs are not supported through the API.
+- **No file upload on the OpenAI-compatible endpoints** — inline images are supported on both `/v1/chat/completions` and `/v1/responses`, but uploaded files there (`file`, `input_file`, `file_id`) and non-image document inputs are not; image uploads go to `POST /api/sessions/{id}/chat/attachments` instead.
 - **Simple OpenAI clients still see an alias** — `/v1/models` advertises the
   stable Hermes alias (`hermes-agent` or the active profile name). Richer
   clients can send explicit `provider` / `model_options` overrides on requests.

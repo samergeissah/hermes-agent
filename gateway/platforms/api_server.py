@@ -69,7 +69,8 @@ _STATIC_FEATURE_FLAGS = {
     "run_status": True, "run_events_sse": True, "run_stop": True, "run_steer": True,
     "run_approval_response": True, "tool_progress_events": True, "approval_events": True,
     "session_resources": True, "model_options": True, "session_chat": True,
-    "session_chat_streaming": True, "session_fork": True, "session_model_lock": True,
+    "session_chat_streaming": True, "session_chat_attachments": True,
+    "session_fork": True, "session_model_lock": True,
     "reasoning_streaming": True,
     "admin_config_rw": False, "jobs_admin": False, "memory_write_api": False,
     "skills_api": True, "audio_api": False, "realtime_voice": False,
@@ -95,6 +96,7 @@ _CAPABILITY_ENDPOINTS = (
     ("session_fork", ("POST", "/api/sessions/{session_id}/fork")),
     ("session_chat", ("POST", "/api/sessions/{session_id}/chat")),
     ("session_chat_stream", ("POST", "/api/sessions/{session_id}/chat/stream")),
+    ("session_chat_attachments", ("POST", "/api/sessions/{session_id}/chat/attachments")),
     ("session_model_lock", ("POST", "/api/sessions/{session_id}/model")),
     ("browser_control_register", ("POST", "/v1/browser-control/register")),
     ("browser_control_ws", ("GET", "/v1/browser-control/ws")),
@@ -135,6 +137,8 @@ except ImportError:
 
 from gateway.config import Platform, PlatformConfig
 from gateway.display_config import resolve_display_setting
+from gateway.platforms import api_server_attachments as _api_attachments
+from gateway.platforms import api_server_image_lane as _api_image_lane
 from gateway.platforms import api_server_room_dispatch as _room_dispatch
 from gateway.platforms import api_server_room_grants as _room_grants
 from gateway.platforms import api_server_runs as _api_runs
@@ -1738,6 +1742,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             ("POST", "/api/sessions/{session_id}/fork", self._handle_fork_session),
             ("POST", "/api/sessions/{session_id}/chat", self._handle_session_chat),
             ("POST", "/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream),
+            ("POST", "/api/sessions/{session_id}/chat/attachments", self._handle_session_chat_attachment),
             ("POST", "/api/sessions/{session_id}/model", self._handle_session_model_lock),
             ("POST", "/v1/chat/completions", self._handle_chat_completions),
             ("POST", "/v1/responses", self._handle_responses),
@@ -3307,12 +3312,16 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         fork = await asyncio.to_thread(db.get_session, fork_id) or {"id": fork_id, "parent_session_id": source_id}
         return web.json_response({"object": "hermes.session", "session": self._session_response(fork)}, status=201)
 
-    async def _prepare_session_chat(self, request: "web.Request") -> tuple:
+    async def _prepare_session_chat(self, request: "web.Request", *, payload: Optional[tuple] = None) -> tuple:
         """Shared prelude for /api/sessions/{id}/chat[/stream]: header/body validation, then
         runtime selection — a Browser model lock (body ``require_model_lock`` or a confirmed
         persisted lock) wins; else the session-persisted model routes via model_routes when an
         alias or threads through as ``session_model`` when raw, then body values.
-        Returns ``(ctx, None)`` or ``(None, error)``; ``ctx["run_kwargs"]`` feeds ``_run_agent``."""
+        Returns ``(ctx, None)`` or ``(None, error)``; ``ctx["run_kwargs"]`` feeds ``_run_agent``.
+
+        ``payload`` is a pre-parsed ``(body, user_message)`` for the routes whose body is not JSON
+        (the multipart attachments upload); absent, the JSON body is read and normalized here.
+        """
         gateway_session_key, key_err = self._parse_session_key_header(request)
         if key_err is not None:
             return None, key_err
@@ -3320,12 +3329,15 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         session, err = await self._get_existing_session_or_404(session_id)
         if err:
             return None, err
-        body, err = await self._read_json_body(request)
-        if err:
-            return None, err
-        user_message, err = _session_chat_user_message(body)
-        if err is not None:
-            return None, err
+        if payload is None:
+            body, err = await self._read_json_body(request)
+            if err:
+                return None, err
+            user_message, err = _session_chat_user_message(body)
+            if err is not None:
+                return None, err
+        else:
+            body, user_message = payload
         try:
             turn_author = _request_turn_author(body)
         except ValueError as exc:
@@ -3533,7 +3545,6 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     async def _handle_session_chat(self, request: "web.Request") -> "web.Response":
         """POST /api/sessions/{session_id}/chat — one synchronous agent turn (plus the delivery lanes'
         one bounded re-run of a transient failure; ``hermes peer dm`` is the client)."""
-        from tools.bot_failure_reasons import RETRY_NONE, result_retry_action
         # This turn runs through _run_agent, so it already COUNTS toward the cap (#7483).
         # Spending the budget without checking it refused every other caller while never
         # refusing this route — and a fleet's cross-machine DMs all arrive here.
@@ -3546,18 +3557,28 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         handed_off = await self._answer_through_live_bot_chat(ctx)
         if handed_off is not None:
             return handed_off
+        return await self._complete_session_chat_turn(ctx)
+
+    async def _complete_session_chat_turn(self, ctx: Dict[str, Any]) -> "web.Response":
+        """Run one prepared session-chat turn and render its completion response.
+
+        Shared by ``/chat`` and ``/chat/attachments`` — both are ONE turn on ONE session and the
+        Android client reads ``content`` out of either reply — so the envelopes cannot drift.
+
+        One policy-gated re-run of a transiently failed turn — the peer-DM transport's half of the
+        retry the local (``tools.bot_mode_dm``) and relayed (``tui_gateway.methods_bot_relay``)
+        delivery lanes already apply (#93091 item 5, #115325). Same policy, same gate: transient
+        classes (429 / 5xx) re-run the SAME session once, a context overflow lets the re-run's
+        pre-API compaction shrink the transcript first, and auth/quota/config/model never re-run. The
+        store is read again first: the failed attempt's turn-start persist left the DM as the
+        transcript's unanswered tail row, and the re-run resumes that row instead of appending a
+        second copy of it. A turn that fails again reaches the peer client exactly as before.
+        """
+        from tools.bot_failure_reasons import RETRY_NONE, result_retry_action
         gateway_session_key = ctx["gateway_session_key"]
         session_id = ctx["session_id"]
         history = await self._conversation_history_for_session(session_id)
         result, usage = await self._run_agent(conversation_history=history, **ctx["run_kwargs"])
-        # One policy-gated re-run of a transiently failed turn — the peer-DM transport's half of the
-        # retry the local (``tools.bot_mode_dm``) and relayed (``tui_gateway.methods_bot_relay``)
-        # delivery lanes already apply (#93091 item 5, #115325). Same policy, same gate: transient
-        # classes (429 / 5xx) re-run the SAME session once, a context overflow lets the re-run's
-        # pre-API compaction shrink the transcript first, and auth/quota/config/model never re-run. The
-        # store is read again first: the failed attempt's turn-start persist left the DM as the
-        # transcript's unanswered tail row, and the re-run resumes that row instead of appending a
-        # second copy of it. A turn that fails again reaches the peer client exactly as before.
         if result_retry_action(result) != RETRY_NONE:
             history = await self._conversation_history_for_session(session_id)
             result, usage = await self._run_agent(
@@ -3702,6 +3723,16 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         except Exception as exc:
             logger.debug("[api_server] session SSE stream error: %s", exc)
         return response
+
+    @_admit_api_agent_request
+    async def _handle_session_chat_attachment(self, request: "web.Request") -> "web.Response":
+        """POST /api/sessions/{session_id}/chat/attachments — one multipart image upload, one turn.
+
+        Adapter on-ramp only; the multipart contract, validation ladder and turn are
+        ``api_server_attachments`` (call-time lookup so test patches on that module take effect).
+        """
+        return await _api_attachments._handle_session_chat_attachment(
+            self, request, _api_server=sys.modules[__name__])
 
     def _register_session_stream_approval(self, run_id: str, events: "_SessionEventQueue", message_id: str):
         """Route a session-stream turn's dangerous-command approvals to its SSE queue and to
@@ -4176,7 +4207,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         ``resume_unanswered_turn`` marks a policy-gated re-run of a turn whose user row the failed attempt
         already persisted: the transcript's unanswered tail row is adopted from ``conversation_history``
         as THIS turn's user message instead of being appended a second time
-        (``agent.session_persistence.adopt_unanswered_turn``; #115325)."""
+        (``agent.session_persistence.adopt_unanswered_turn``; #115325).
+        ``user_message`` may carry OpenAI image parts (inline JSON or a multipart upload): they are
+        routed through the shared image-input decision before ``run_conversation``, so a configured
+        vision backend keeps the pixels off the main model (``api_server_image_lane``)."""
         loop = asyncio.get_running_loop()
         # ContextVars do not follow run_in_executor threads: capture here, re-enter in _run().
         request_profile = _api_request_profile.get()
@@ -4208,13 +4242,19 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                         session_model=session_model, confirmed_runtime_lock=confirmed_runtime_lock)
                     if agent_ref is not None:
                         agent_ref[0] = agent
+                    # Every api_server lane hands over ALREADY-normalized OpenAI content parts
+                    # (inline JSON image inputs, or the multipart attachments upload). Route them
+                    # through the decision every messaging lane makes BEFORE the turn runs, so a
+                    # configured vision backend keeps the pixels off the paid main model — see
+                    # api_server_image_lane.py (the routing table itself lives in agent/image_routing.py).
+                    routed_message = _api_image_lane.route_user_message(agent, user_message)
                     if resume_unanswered_turn:
                         # A dispatcher's re-run of a failed delivery turn: the DM's own row is already
                         # in the store (the failed attempt persisted it at turn start), so continue THAT
                         # row instead of appending a second copy of the same text (#115325).
                         from agent.session_persistence import adopt_unanswered_turn
 
-                        adopt_unanswered_turn(conversation_history, user_message, agent)
+                        adopt_unanswered_turn(conversation_history, routed_message, agent)
                     if active_run_id:
                         self._active_run_agents[active_run_id] = agent
                     effective_task_id = session_id or str(uuid.uuid4())
@@ -4235,7 +4275,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     # Passed only when set: a human turn keeps today's call shape.
                     author_kwargs = {"turn_author": turn_author} if turn_author is not None else {}
                     conversation_kwargs = dict(
-                        user_message=user_message,
+                        user_message=routed_message,
                         conversation_history=conversation_history,
                         task_id=effective_task_id,
                         **author_kwargs,
