@@ -2411,6 +2411,21 @@ class GatewayTurnMixin:
         from agent.skill_utils import parse_config_string_list
         enabled = self._resolve_enabled_toolsets_for_source(user_config, source, platform_key)
         disabled = parse_config_string_list((user_config.get("agent") or {}).get("disabled_toolsets")) or None
+        # Diagnostic (t_13eac455): pin the resolved selection + config provenance at every
+        # agent turn so a live divergence (an explicit ``platform_toolsets.<platform>`` entry
+        # being ignored) is attributable to resolution vs. later schema assembly.
+        try:
+            from hermes_cli.config import get_config_path
+            from utils import file_signature
+            _cfg_path = get_config_path()
+            _cfg_stat = _cfg_path.stat() if _cfg_path is not None else None
+            _cfg_sig = file_signature(_cfg_stat) if _cfg_stat is not None else None
+        except Exception:  # pragma: no cover — diagnostic must never break resolution
+            _cfg_path, _cfg_sig = None, None
+        logger.debug(
+            "turn toolsets resolved: platform=%s kanban_enabled=%s enabled=%s config=%s config_sig=%s",
+            platform_key, "kanban" in enabled, enabled, _cfg_path, _cfg_sig,
+        )
         return enabled, disabled
 
     async def _run_background_task_inner(
