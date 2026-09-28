@@ -78,19 +78,26 @@ def content_text(content: Any) -> str:
     ).strip()
 
 
-def build_upload_content(message: str, filename: str, mime: str, raw: bytes) -> List[Dict[str, Any]]:
+def build_upload_content(message: str, filename: str, mime: str, raw: bytes,
+                         stored_path: str = "") -> List[Dict[str, Any]]:
     """Canonical user content for one uploaded image: caption text part + one ``image_url`` part.
 
     Same shape ``agent.image_routing.build_native_content_parts`` produces for a local file
     (caption carrying an ``[Image attached: …]`` handle), except the bytes are encoded inline —
-    an upload never touches the server's filesystem, so there is no path for a tool to re-read
-    and the data URL IS the handle.
+    an upload needs no filesystem round-trip to reach the model, and the data URL survives cache
+    retention. ``stored_path`` is the image-cache copy the upload lane also made
+    (``api_server_attachments._cache_upload``); when present it adds the same
+    ``[Image attached at: <path>]`` handle the local-file lanes emit, so a tool that takes a path
+    (``vision_analyze``, media delivery) can re-read the very pixels of this turn.
     """
     caption = (message or "").strip() or _EMPTY_CAPTION
     label = (filename or "").strip() or "upload"
     data_url = f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"
+    attached = f"[Image attached: {label} ({mime})]"
+    if (stored_path or "").strip():
+        attached += f"\n[Image attached at: {stored_path.strip()}]"
     return [
-        {"type": "text", "text": f"{caption}\n\n[Image attached: {label} ({mime})]"},
+        {"type": "text", "text": f"{caption}\n\n{attached}"},
         {"type": "image_url", "image_url": {"url": data_url}},
     ]
 

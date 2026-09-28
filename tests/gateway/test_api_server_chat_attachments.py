@@ -7,7 +7,15 @@ Behaviour under test — not snapshots:
   Bearer auth as the rest of the ``/api`` surface;
 * a multipart image upload runs ONE real session turn carrying an image part and answers with
   the same completion envelope ``/chat`` answers with;
-* a non-image upload / missing file is refused before any turn runs;
+* the upload is cached to disk (the inbound image cache) and the turn's caption carries that
+  absolute path;
+* the same lane accepts DOCUMENTS — the file source both Eve clients offer — persisting them to
+  the documents cache beside the images and handing the turn their absolute path as a text turn
+  (no inline part, no vision backend: a document is read with tools, not looked at);
+* the document types accepted are the ones the two clients really send, including the
+  ``application/octet-stream`` declaration iOS and Android fall back to for a file they cannot
+  name (office documents land there);
+* a non-image, non-document upload / missing file is refused before any turn runs;
 * the shared image-input decision is consulted for BOTH the upload lane and the pre-existing
   inline-image lane, and BOTH of its branches are honoured: ``native`` keeps the pixels on the
   main model, ``text`` keeps them off it.
@@ -16,6 +24,7 @@ Behaviour under test — not snapshots:
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 from unittest.mock import patch
 
@@ -34,7 +43,11 @@ ATTACHMENTS_PATH = "/api/sessions/{session_id}/chat/attachments"
 PNG_BYTES = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEklEQVR4nGPkEpFjYGBgYgAD"
     "AALmAEAUQs4PAAAAAElFTkSuQmCC")
-PDF_BYTES = b"%PDF-1.4\n% not an image at all\n"
+PDF_BYTES = (b"%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\ntrailer<</Root 1 0 R>>\n"
+             b"%%EOF\n")
+TEXT_BYTES = b"# Notes\n\n- one\n- two\n"
+# Not a real .docx (nothing here parses office formats); the bytes only have to round-trip.
+DOCX_BYTES = b"PK\x03\x04" + b"\x00" * 24 + b"word/document.xml"
 
 FORWARD = "A 1x1 test image."
 
@@ -51,9 +64,16 @@ def session_db(tmp_path):
 
 
 @pytest.fixture
-def adapter(session_db):
+def adapter(session_db, tmp_path, monkeypatch):
     """Authenticated adapter: the client contract always sends a session-key header, which
-    requires a configured API key, so the upload lane is exercised the way the app posts it."""
+    requires a configured API key, so the upload lane is exercised the way the app posts it.
+
+    Both inbound caches are redirected into ``tmp_path`` (the same seam the voice-note suite uses
+    for the audio cache) so a test run never litters the real profile cache — images AND the
+    documents cache the widened lane writes to.
+    """
+    monkeypatch.setattr("gateway.platforms.base.IMAGE_CACHE_DIR", str(tmp_path / "images"))
+    monkeypatch.setattr("gateway.platforms.base.DOCUMENT_CACHE_DIR", str(tmp_path / "documents"))
     adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": API_KEY}))
     adapter._session_db = session_db
     return adapter
@@ -113,6 +133,14 @@ class _CapturingAgent:
 
 def _data_url_parts(message):
     return [p for p in message if isinstance(p, dict) and p.get("type") == "image_url"]
+
+
+def _turn_text(message) -> str:
+    """The text a turn was handed, whichever shape the lane used (plain string or text parts)."""
+    if isinstance(message, str):
+        return message
+    return "\n".join(
+        str(part.get("text") or "") for part in message if isinstance(part, dict))
 
 
 # --------------------------------------------------------------------------- route contract
@@ -179,6 +207,33 @@ async def test_upload_runs_a_session_turn_carrying_the_image(adapter, session_id
 
 
 @pytest.mark.asyncio
+async def test_upload_leaves_the_image_on_disk(adapter, session_id, tmp_path):
+    """The bytes land in the inbound image cache, and the turn is handed the path.
+
+    The file on disk is the point: it is what a later turn (or an operator) can re-read after the
+    inline ``data:`` part is gone from the wire, and it is the same cache every messaging lane's
+    inbound image goes through.
+    """
+    agent = _CapturingAgent(session_id)
+    with patch.object(adapter, "_create_agent", return_value=agent), patch(
+            "agent.image_routing.decide_image_input_mode", return_value="native"):
+        async with _client(adapter) as cli:
+            resp = await cli.post(
+                f"/api/sessions/{session_id}/chat/attachments",
+                data=_upload_form(filename="throwaway-probe.png"),
+                headers=_headers(session_id))
+            assert resp.status == 200, await resp.text()
+
+    stored = sorted((tmp_path / "images").glob("img_*.png"))
+    assert len(stored) == 1, [p.name for p in (tmp_path / "images").iterdir()]
+    assert stored[0].read_bytes() == PNG_BYTES, "the cached file must be the uploaded bytes"
+
+    text = _turn_text(agent.calls[0]["user_message"])
+    assert f"[Image attached at: {stored[0]}]" in text
+    assert "throwaway-probe.png" in text, "the client's filename is still the human label"
+
+
+@pytest.mark.asyncio
 async def test_upload_without_a_prompt_still_runs_the_turn(adapter, session_id):
     agent = _CapturingAgent(session_id)
     with patch.object(adapter, "_create_agent", return_value=agent), patch(
@@ -219,17 +274,165 @@ async def test_upload_text_routing_keeps_pixels_off_the_main_model(adapter, sess
     assert analyzed and analyzed[0].startswith("data:image/png;base64,"), "the vision backend got the bytes"
 
 
+# --------------------------------------------------------------------------- document lane
+
+
 @pytest.mark.asyncio
-async def test_non_image_upload_is_refused_without_running_a_turn(adapter, session_id):
+async def test_pdf_upload_runs_a_turn_carrying_the_persisted_path(adapter, session_id, tmp_path):
+    """A PDF is accepted, runs ONE real turn, and reaches it with its path on disk.
+
+    Before this lane accepted documents, a PDF from the file picker got a 415 — the same picker
+    path the two Eve clients already expose. The turn must be a plain text turn (a document is
+    read with tools, not looked at inline) and the persisted file must be the uploaded bytes: it
+    is what the agent's own file tools will open.
+    """
+    agent = _CapturingAgent(session_id)
+    with patch.object(adapter, "_create_agent", return_value=agent), patch(
+            "agent.image_routing.decide_image_input_mode") as decide:
+        async with _client(adapter) as cli:
+            resp = await cli.post(
+                f"/api/sessions/{session_id}/chat/attachments",
+                data=_upload_form(message="Summarise this.", mime="application/pdf",
+                                  data=PDF_BYTES, filename="quarterly-report.pdf"),
+                headers=_headers(session_id))
+            assert resp.status == 200, await resp.text()
+            payload = await resp.json()
+
+    # The envelope is the image lane's, byte for byte in shape: the clients parse it identically.
+    assert payload["object"] == "hermes.session.chat.completion"
+    assert payload["session_id"] == session_id
+    assert payload["message"]["role"] == "assistant"
+    assert payload["message"]["content"] == FORWARD
+
+    stored = sorted((tmp_path / "documents").glob("doc_*quarterly-report.pdf"))
+    assert len(stored) == 1, [p.name for p in (tmp_path / "documents").iterdir()]
+    assert stored[0].read_bytes() == PDF_BYTES, "the cached file must be the uploaded bytes"
+    assert hashlib.sha256(stored[0].read_bytes()).hexdigest() == hashlib.sha256(PDF_BYTES).hexdigest()
+
+    message = agent.calls[0]["user_message"]
+    assert isinstance(message, str), "a document turn is text-only, never an inline part list"
+    assert "Summarise this." in message
+    assert "[Document attached: quarterly-report.pdf (application/pdf)]" in message
+    assert f"[Document attached at: {stored[0]}]" in message
+    assert not decide.called, "a document must not pay for the image-routing decision"
+    assert not (tmp_path / "images").exists() or not list((tmp_path / "images").iterdir()), \
+        "a document must not be written into the image cache"
+
+
+@pytest.mark.asyncio
+async def test_text_upload_without_a_prompt_gets_a_document_caption(adapter, session_id, tmp_path):
+    agent = _CapturingAgent(session_id)
+    with patch.object(adapter, "_create_agent", return_value=agent), patch(
+            "agent.image_routing.decide_image_input_mode"):
+        async with _client(adapter) as cli:
+            resp = await cli.post(
+                f"/api/sessions/{session_id}/chat/attachments",
+                data=_upload_form(message="", mime="text/plain", data=TEXT_BYTES,
+                                  filename="notes.md"),
+                headers=_headers(session_id))
+            assert resp.status == 200, await resp.text()
+
+    message = agent.calls[0]["user_message"]
+    assert "What's in this document?" in message
+    stored = sorted((tmp_path / "documents").glob("doc_*notes.md"))
+    assert len(stored) == 1
+    assert stored[0].read_bytes() == TEXT_BYTES
+
+
+# The exact (declared MIME, filename) pairs the two clients put on the wire:
+#   * iOS  — ``ChatAttachment.mimeType(forPathExtension:)`` (EveIOS/ChatAttachments.swift);
+#   * Android — the picker's own type, else ``application/octet-stream``
+#     (``attachAndSend`` in EveApp.kt + ``sendAttachmentWithPrompt`` in EveViewModel.kt).
+# Both send ``message`` / ``filename`` / ``mime_type`` / ``file``, so one table covers both.
+_CLIENT_DOCUMENT_UPLOADS = [
+    ("application/pdf", "report.pdf"),                      # both clients
+    ("text/plain", "notes.txt"),                            # iOS + Android
+    ("text/plain", "notes.md"),                             # iOS maps .md/.log -> text/plain
+    ("text/markdown", "readme.md"),                         # Android picker
+    ("text/csv", "rows.csv"),                               # iOS + Android
+    ("application/json", "payload.json"),                   # iOS + Android
+    ("application/vnd.openxmlformats-officedocument.wordprocessingml.document", "memo.docx"),
+    ("application/octet-stream", "memo.docx"),              # iOS: no case for .docx -> octet-stream
+    ("application/octet-stream", "sheet.xlsx"),             # Android: ContentResolver gave nothing
+    ("application/octet-stream", "deck.pptx"),
+    ("application/octet-stream", "contract.rtf"),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mime,filename", _CLIENT_DOCUMENT_UPLOADS)
+async def test_the_types_the_two_clients_send_are_accepted(adapter, session_id, tmp_path,
+                                                           mime, filename):
+    """Every declaration the iOS/Android pickers can produce for a document is accepted.
+
+    ``application/octet-stream`` is the important row: it is what BOTH clients send for a file they
+    have no MIME case for, and the only remaining evidence is the bytes' signature or the name.
+    """
+    agent = _CapturingAgent(session_id)
+    payload_bytes = PDF_BYTES if filename.endswith(".pdf") else (
+        DOCX_BYTES if filename.endswith((".docx", ".xlsx", ".pptx")) else TEXT_BYTES)
+    with patch.object(adapter, "_create_agent", return_value=agent), patch(
+            "agent.image_routing.decide_image_input_mode"):
+        async with _client(adapter) as cli:
+            resp = await cli.post(
+                f"/api/sessions/{session_id}/chat/attachments",
+                data=_upload_form(message="read this", mime=mime, data=payload_bytes,
+                                  filename=filename),
+                headers=_headers(session_id))
+            body = await resp.text()
+            assert resp.status == 200, f"{mime} / {filename}: {body}"
+            assert (await resp.json())["object"] == "hermes.session.chat.completion"
+
+    stored = sorted((tmp_path / "documents").glob(f"doc_*{filename}"))
+    assert len(stored) == 1, [p.name for p in (tmp_path / "documents").iterdir()]
+    assert stored[0].read_bytes() == payload_bytes
+    assert f"[Document attached at: {stored[0]}]" in agent.calls[0]["user_message"]
+
+
+@pytest.mark.asyncio
+async def test_unsupported_attachment_type_is_refused_without_running_a_turn(adapter, session_id):
+    """A type the lane has no reading for is still refused — with the accepted set named."""
     with patch.object(adapter, "_create_agent") as create:
         async with _client(adapter) as cli:
             resp = await cli.post(
                 f"/api/sessions/{session_id}/chat/attachments",
-                data=_upload_form(mime="application/pdf", data=PDF_BYTES, filename="doc.pdf"),
+                data=_upload_form(mime="application/x-msdownload", data=b"MZ\x90\x00",
+                                  filename="installer.exe"),
                 headers=_headers(session_id))
             body = await resp.json()
 
     assert resp.status == 415
+    assert body["error"]["code"] == "unsupported_media_type"
+    assert "application/x-msdownload" in body["error"]["message"]
+    assert "this endpoint accepts images" in body["error"]["message"]
+    assert "pdf" in body["error"]["message"], "the refusal names what IS accepted"
+    assert "voice-note" in body["error"]["message"], "audio is pointed at the route that takes it"
+    assert not create.called
+
+
+# Types another lane owns (audio) or nothing here handles: still a 415, never a silent accept —
+# a declared type that is neither opaque nor accepted is honoured as a refusal, so a filename can
+# never smuggle a payload into an extension it could not be opened with.
+_REFUSED_UPLOADS = [
+    ("application/x-msdownload", "installer.exe", b"MZ\x90\x00"),
+    ("audio/mpeg", "clip.mp3", b"ID3\x04\x00\x00"),
+    ("video/mp4", "clip.mp4", b"\x00\x00\x00\x18ftypmp42"),
+    ("application/x-nonsense", "payload.xyz", b"\x7fELF-not-a-document"),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mime,filename,data", _REFUSED_UPLOADS)
+async def test_unhandled_types_are_refused(adapter, session_id, mime, filename, data):
+    with patch.object(adapter, "_create_agent") as create:
+        async with _client(adapter) as cli:
+            resp = await cli.post(
+                f"/api/sessions/{session_id}/chat/attachments",
+                data=_upload_form(mime=mime, data=data, filename=filename),
+                headers=_headers(session_id))
+            body = await resp.json()
+
+    assert resp.status == 415, f"{mime} / {filename} unexpectedly accepted"
     assert body["error"]["code"] == "unsupported_media_type"
     assert not create.called
 
