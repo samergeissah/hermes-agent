@@ -74,6 +74,7 @@ _STATIC_FEATURE_FLAGS = {
     "reasoning_streaming": True,
     "admin_config_rw": False, "jobs_admin": False, "memory_write_api": False,
     "skills_api": True, "audio_api": False, "realtime_voice": False,
+    "session_voice_note": True,
     "session_continuity_header": "X-Hermes-Session-Id",
     "session_key_header": "X-Hermes-Session-Key"}
 # /v1/capabilities "endpoints" table: name -> (method, path).
@@ -98,6 +99,7 @@ _CAPABILITY_ENDPOINTS = (
     ("session_chat_stream", ("POST", "/api/sessions/{session_id}/chat/stream")),
     ("session_chat_attachments", ("POST", "/api/sessions/{session_id}/chat/attachments")),
     ("session_model_lock", ("POST", "/api/sessions/{session_id}/model")),
+    ("session_voice_note", ("POST", "/api/sessions/{session_id}/voice-note")),
     ("browser_control_register", ("POST", "/v1/browser-control/register")),
     ("browser_control_ws", ("GET", "/v1/browser-control/ws")),
     ("artifact_upload", ("POST", "/v1/artifacts/upload")),
@@ -1744,6 +1746,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             ("POST", "/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream),
             ("POST", "/api/sessions/{session_id}/chat/attachments", self._handle_session_chat_attachment),
             ("POST", "/api/sessions/{session_id}/model", self._handle_session_model_lock),
+            ("POST", "/api/sessions/{session_id}/voice-note", self._handle_session_voice_note),
             ("POST", "/v1/chat/completions", self._handle_chat_completions),
             ("POST", "/v1/responses", self._handle_responses),
             ("GET", "/v1/responses/{response_id}", self._handle_get_response),
@@ -3793,6 +3796,69 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             model_lock="accepted")
         return web.json_response(
             {"object": "hermes.session.model_lock", "session_id": session_id, "runtime": runtime})
+
+    @_require_auth
+    async def _handle_session_voice_note(self, request: "web.Request") -> "web.Response":
+        """POST /api/sessions/{session_id}/voice-note — accept a voice-note audio blob
+        (multipart ``mode``/``filename``/``mime_type``/``audio``, ``X-Hermes-Session-Key``
+        header) and store it in the gateway's existing inbound audio cache. Returns a receipt
+        with the absolute stored path (2xx on success). The same contract the iOS/Android
+        clients already send (GEI-119/GEI-102)."""
+        session_id = request.match_info["session_id"]
+        _, err = await self._get_existing_session_or_404(session_id)
+        if err:
+            return err
+        gateway_session_key, key_err = self._parse_session_key_header(request)
+        if key_err is not None:
+            return key_err
+
+        mode = filename = mime_type = ""
+        audio_bytes = None
+        try:
+            reader = await request.multipart()
+        except Exception:
+            return _error_response(
+                "Request must be multipart/form-data", 400, code="invalid_multipart")
+        try:
+            while True:
+                part = await reader.next()
+                if part is None:
+                    break
+                name = (part.name or "").strip()
+                if name == "audio":
+                    audio_bytes = await part.read()
+                elif name == "mode":
+                    mode = (await part.text()).strip()
+                elif name == "filename":
+                    filename = (await part.text()).strip()
+                elif name == "mime_type":
+                    mime_type = (await part.text()).strip()
+        except Exception:
+            return _error_response("Failed to read multipart body", 400, code="invalid_multipart")
+        if audio_bytes is None:
+            return _error_response(
+                "Missing 'audio' file field", 400, code="missing_audio")
+        if not audio_bytes:
+            return _error_response("Empty audio file", 400, code="empty_audio")
+
+        # Store via the same primitive inbound platform voice notes use (container-sniffed
+        # extension + the inbound media size cap); local import, base is heavyweight.
+        from gateway.platforms.base import cache_audio_from_bytes_async
+        try:
+            path = await cache_audio_from_bytes_async(audio_bytes, ".m4a")
+        except ValueError as exc:
+            status = 413 if "too large" in str(exc) else 400
+            return _error_response(str(exc), status, code="audio_rejected")
+
+        return web.json_response({
+            "object": "hermes.session.voice_note",
+            "session_id": session_id,
+            "mode": mode or "voice_note",
+            "filename": filename,
+            "mime_type": mime_type,
+            "bytes": len(audio_bytes),
+            "path": path,
+        }, status=201)
 
     # -- Cron jobs API ----------------------------------------------------------------
 
