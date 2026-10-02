@@ -3,6 +3,11 @@
 The ledger records what is known about each attempt; it is not a retry queue. Interrupted attempts
 become ``unknown`` only after their owner process is proved gone — a start-time reading that fails
 to match the claim-time fingerprint is not proof of death. Terminal states are immutable.
+
+Each attempt carries an explicit lease (``lease_until``, derived from the shared
+``FIRE_CLAIM_TTL_SECONDS``) and an append-only ``execution_events`` trail, so an attempt can never
+be reported as running past a lease that has lapsed and its history can be inspected without
+reconstructing it from mutable job-store fields.
 """
 
 from __future__ import annotations
@@ -14,13 +19,13 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 
 from hermes_constants import get_hermes_home
 from hermes_time import now as _hermes_now
-from cron.constants import CLAIM_TTL_INACTIVITY_HEADROOM
+from cron.constants import CLAIM_TTL_INACTIVITY_HEADROOM, FIRE_CLAIM_TTL_SECONDS
 from hermes_cli.observability.shared_metrics_gateway import record_cron_finish
 
 # Optional test override. Production resolves the path at transaction time so dashboard operations
@@ -32,6 +37,25 @@ HANDOFF_ADOPTION_GRACE_SECONDS = 30.0
 # Floor for the live-owner stale-claim bound (#115692); see _live_owner_stale_after_seconds.
 LIVE_OWNER_STALE_CLAIM_FLOOR_SECONDS = 7200.0
 _TERMINAL_STATES = ("completed", "failed", "unknown")
+# Frozen outcome vocabulary: a run is ``completed`` or ``failed`` only when the ledger can prove
+# it; anything the ledger cannot prove (interrupted, no finish record, expired claim) is
+# ``unknown`` — never rounded up to a success.
+EXECUTION_OUTCOMES = ("completed", "failed", "unknown")
+# Append-only per-run event kinds (OpenDots run/event split).
+EVENT_CLAIMED = "claimed"
+EVENT_STARTED = "started"
+EVENT_FINISHED = "finished"
+EVENT_FAILED = "failed"
+EVENT_RECLAIMED = "reclaimed"
+EVENT_DELIVERED = "delivered"
+EVENT_NOT_DELIVERED = "not_delivered"
+EXECUTION_EVENT_KINDS = (
+    EVENT_CLAIMED, EVENT_STARTED, EVENT_FINISHED, EVENT_FAILED,
+    EVENT_RECLAIMED, EVENT_DELIVERED, EVENT_NOT_DELIVERED,
+)
+# Delivery state: the real destination, or ``none`` when no destination was resolved.
+DELIVERY_NONE = "none"
+_DELIVERED_OUTCOMES = ("delivered",)
 _lock = threading.RLock()
 _PROCESS_ID = uuid.uuid4().hex
 
@@ -88,10 +112,66 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     )
     add_column_if_missing(conn, "executions", "delivery_outcome", "delivery_outcome TEXT")
     add_column_if_missing(conn, "executions", "scheduled_instant", "scheduled_instant TEXT")
+    # Explicit lease deadline (ISO instant), derived from FIRE_CLAIM_TTL_SECONDS. Legacy rows
+    # without one keep the age-based reading; see execution_lease_expired().
+    add_column_if_missing(conn, "executions", "lease_until", "lease_until TEXT")
+    # The real delivery destination resolved for the run ("origin", "local", "telegram:123"...),
+    # or the literal "none" when no destination exists.
+    add_column_if_missing(conn, "executions", "delivery_target", "delivery_target TEXT")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_executions_occurrence "
         "ON executions(job_id, scheduled_instant) WHERE status='completed'"
     )
+    # Append-only per-run trail. Rows are only INSERTed (and pruned with their execution); the
+    # ledger never rewrites history, so a run's lifecycle is inspectable after the fact.
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS execution_events (
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             execution_id TEXT NOT NULL,
+             job_id TEXT NOT NULL,
+             kind TEXT NOT NULL CHECK(kind IN
+               ('claimed','started','finished','failed','reclaimed','delivered','not_delivered')),
+             detail TEXT,
+             target TEXT,
+             created_at TEXT NOT NULL
+           )"""
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_execution_events_execution "
+        "ON execution_events(execution_id, id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_execution_events_job "
+        "ON execution_events(job_id, id)"
+    )
+
+
+def _append_event(
+    conn: sqlite3.Connection, *, execution_id: str, job_id: str, kind: str,
+    detail: Optional[str] = None, target: Optional[str] = None,
+) -> None:
+    """Append one lifecycle event for an attempt. Append-only: never updated or deleted here."""
+    conn.execute(
+        """INSERT INTO execution_events
+           (execution_id, job_id, kind, detail, target, created_at)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (str(execution_id), str(job_id), str(kind), detail, target, _hermes_now().isoformat()),
+    )
+
+
+def normalize_delivery_outcome(value: Any) -> str:
+    """The recorded delivery state: the caller's real outcome, or ``none`` when there is none.
+
+    ``none`` is a statement about the ledger (no destination/outcome was recorded), not a
+    fabricated success — ``delivered`` is only ever written by a caller that observed a send.
+    """
+    text = str(value).strip() if value not in (None, "") else ""
+    return text or DELIVERY_NONE
+
+
+def _lease_deadline(now: datetime) -> str:
+    """The explicit lease deadline for a claim taken at ``now``, from FIRE_CLAIM_TTL_SECONDS."""
+    return (now + timedelta(seconds=FIRE_CLAIM_TTL_SECONDS)).isoformat()
 
 
 @contextmanager
@@ -171,6 +251,33 @@ def _claim_age_seconds(claimed_at: str) -> float:
     return (_hermes_now() - datetime.fromisoformat(claimed_at)).total_seconds()
 
 
+def execution_lease_expired(
+    record: Dict[str, Any], *, now: Optional[datetime] = None
+) -> bool:
+    """True when this attempt's explicit lease has lapsed.
+
+    The lease is the one the attempt was claimed under (``lease_until``, derived from the shared
+    ``FIRE_CLAIM_TTL_SECONDS`` and refreshed while the run is genuinely alive). A legacy row
+    without an explicit deadline falls back to the same TTL over ``claimed_at`` — never a second
+    TTL. A malformed/absent ``claimed_at`` reads as expired: the ledger cannot prove the lease is
+    still held, so it must not be reported as running.
+    """
+    moment = now or _hermes_now()
+    raw = record.get("lease_until")
+    if raw:
+        try:
+            return moment >= datetime.fromisoformat(str(raw))
+        except ValueError:
+            return True
+    claimed_at = record.get("claimed_at")
+    if not claimed_at:
+        return True
+    try:
+        return _claim_age_seconds(str(claimed_at)) >= FIRE_CLAIM_TTL_SECONDS
+    except ValueError:
+        return True
+
+
 def _prune_unlocked(conn: sqlite3.Connection) -> None:
     conn.execute(
         """DELETE FROM executions WHERE id IN (
@@ -181,6 +288,11 @@ def _prune_unlocked(conn: sqlite3.Connection) -> None:
            )""",
         (max(0, int(MAX_TERMINAL_EXECUTIONS)),),
     )
+    # Events live and die with their execution: pruning an attempt prunes its trail, so the
+    # append-only log stays bounded without rewriting any live run's history.
+    conn.execute(
+        "DELETE FROM execution_events WHERE execution_id NOT IN (SELECT id FROM executions)"
+    )
 
 
 def create_execution(
@@ -189,17 +301,22 @@ def create_execution(
     """Persist a claimed attempt before executor/provider dispatch."""
     from cron.occurrences import scheduled_instant as canonical_instant
 
-    now = _hermes_now().isoformat()
+    now = _hermes_now()
     execution_id = uuid.uuid4().hex
     pid = os.getpid()
     with _transaction() as conn:
         conn.execute(
             """INSERT INTO executions
                (id, job_id, source, process_id, pid, process_started_at,
-                status, claimed_at, scheduled_instant)
-               VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?, ?)""",
+                status, claimed_at, scheduled_instant, lease_until)
+               VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?, ?, ?)""",
             (execution_id, str(job_id), str(source), _PROCESS_ID, pid,
-             _process_start_time(pid), now, canonical_instant(scheduled_instant)),
+             _process_start_time(pid), now.isoformat(),
+             canonical_instant(scheduled_instant), _lease_deadline(now)),
+        )
+        _append_event(
+            conn, execution_id=execution_id, job_id=job_id,
+            kind=EVENT_CLAIMED, detail=str(source),
         )
         record = _fetch(conn, execution_id)
     _emit_execution_state(record)
@@ -246,37 +363,50 @@ def adopt_claimed_execution(execution_id: str) -> Optional[Dict[str, Any]]:
     """
     pid = os.getpid()
     process_started_at = _process_start_time(pid)
-    now = _hermes_now().isoformat()
+    now = _hermes_now()
     with _transaction() as conn:
         cur = conn.execute(
             """UPDATE executions
                SET process_id=?, pid=?, process_started_at=?,
                    status='running', started_at=?, handoff_pending=0,
-                   handoff_started_at=NULL
+                   handoff_started_at=NULL, lease_until=?
                WHERE id=? AND status='claimed' AND handoff_pending=1""",
-            (_PROCESS_ID, pid, process_started_at, now, execution_id),
+            (_PROCESS_ID, pid, process_started_at, now.isoformat(),
+             _lease_deadline(now), execution_id),
         )
         if cur.rowcount != 1:
             return None
+        row = _fetch(conn, execution_id)
+        if row is not None:
+            _append_event(
+                conn, execution_id=execution_id, job_id=str(row["job_id"]),
+                kind=EVENT_STARTED,
+            )
         record = _fetch(conn, execution_id)
     _emit_execution_state(record)
     return record
 
 
 def mark_execution_running(execution_id: str) -> Optional[Dict[str, Any]]:
-    """Transition one claimed attempt to running exactly once."""
-    now = _hermes_now().isoformat()
+    """Transition one claimed attempt to running exactly once, refreshing its explicit lease."""
+    now = _hermes_now()
     with _transaction() as conn:
         cur = conn.execute(
             """UPDATE executions
                SET status='running', started_at=?, handoff_pending=0,
-                   handoff_started_at=NULL
+                   handoff_started_at=NULL, lease_until=?
                WHERE id=? AND status='claimed' AND handoff_pending=0
                  AND process_id=? AND pid=?""",
-            (now, execution_id, _PROCESS_ID, os.getpid()),
+            (now.isoformat(), _lease_deadline(now), execution_id, _PROCESS_ID, os.getpid()),
         )
         if cur.rowcount != 1:
             return None
+        row = _fetch(conn, execution_id)
+        if row is not None:
+            _append_event(
+                conn, execution_id=execution_id, job_id=str(row["job_id"]),
+                kind=EVENT_STARTED,
+            )
         record = _fetch(conn, execution_id)
     _emit_execution_state(record)
     return record
@@ -284,27 +414,47 @@ def mark_execution_running(execution_id: str) -> Optional[Dict[str, Any]]:
 
 def finish_execution(
     execution_id: str, *, success: bool, error: Optional[str] = None,
-    delivery_outcome: Optional[str] = None,
+    delivery_outcome: Optional[str] = None, delivery_target: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Write a terminal result once; terminal attempts cannot be rewritten."""
+    """Write a terminal result once; terminal attempts cannot be rewritten.
+
+    ``delivery_outcome`` is normalised to the real state or ``none``; ``delivery_target`` is the
+    actual destination the result was bound to (the originating conversation/job lane) or ``none``.
+    Both are recorded as an append-only ``delivered``/``not_delivered`` event.
+    """
     now = _hermes_now().isoformat()
     status = "completed" if success else "failed"
     detail = None if success else (str(error) if error else "unknown failure")
+    outcome = normalize_delivery_outcome(delivery_outcome)
+    target = str(delivery_target).strip() if delivery_target not in (None, "") else DELIVERY_NONE
     with _transaction() as conn:
         cur = conn.execute(
             """UPDATE executions
                SET status=?, finished_at=?, error=?, handoff_pending=0,
-                   handoff_started_at=NULL, delivery_outcome=?
+                   handoff_started_at=NULL, delivery_outcome=?, delivery_target=?
                WHERE id=? AND status IN ('claimed','running')
                  AND process_id=? AND pid=?""",
-            (status, now, detail, delivery_outcome, execution_id, _PROCESS_ID, os.getpid()),
+            (status, now, detail, outcome, target, execution_id, _PROCESS_ID, os.getpid()),
         )
         if cur.rowcount != 1:
             return None
+        row = _fetch(conn, execution_id)
+        if row is not None:
+            _append_event(
+                conn, execution_id=execution_id, job_id=str(row["job_id"]),
+                kind=EVENT_FINISHED if success else EVENT_FAILED,
+                detail=detail,
+            )
+            _append_event(
+                conn, execution_id=execution_id, job_id=str(row["job_id"]),
+                kind=(EVENT_DELIVERED if outcome in _DELIVERED_OUTCOMES
+                      else EVENT_NOT_DELIVERED),
+                detail=outcome, target=target,
+            )
         _prune_unlocked(conn)
         record = _fetch(conn, execution_id)
-    _emit_execution_state(record, delivery_outcome=delivery_outcome)
-    record_cron_finish(record, delivery_outcome)
+    _emit_execution_state(record, delivery_outcome=outcome)
+    record_cron_finish(record, outcome)
     return record
 
 
@@ -316,6 +466,11 @@ _OWNER_WEDGED_REASON = (
     "Owner process is still alive but the claim outlived the derived stale bound; "
     "treated as wedged (#115692). The process was not terminated; whether side effects "
     "ran is unknown."
+)
+_LEASE_EXPIRED_REASON = (
+    "Execution lease expired before a durable terminal state was recorded (no heartbeat "
+    "within FIRE_CLAIM_TTL_SECONDS); the attempt may have been redelivered, so whether "
+    "side effects ran is unknown."
 )
 
 
@@ -332,15 +487,21 @@ def recover_interrupted_executions() -> int:
     stale_after_resolved = False
     with _transaction() as conn:
         rows = conn.execute(
-            """SELECT id, status, process_id, pid, process_started_at,
-                      handoff_pending, handoff_started_at, claimed_at
+            """SELECT id, job_id, status, process_id, pid, process_started_at,
+                      handoff_pending, handoff_started_at, claimed_at, lease_until
                FROM executions
                WHERE status IN ('claimed','running')"""
         ).fetchall()
         for row in rows:
             if row["process_id"] == _PROCESS_ID:
                 continue
-            reason = _OWNER_GONE_REASON
+            # Record the real reason, never a generic one: an expired lease is reported as an
+            # expired lease (the attempt may have been redelivered), not silently as a restart.
+            reason = (
+                _LEASE_EXPIRED_REASON
+                if execution_lease_expired(dict(row))
+                else _OWNER_GONE_REASON
+            )
             if _owner_is_live(int(row["pid"]), row["process_started_at"]):
                 # A live owner is normally a legitimately running job. A worker permanently
                 # deadlocked (e.g. futex_wait behind a route/proxy flip, #115692) also passes
@@ -376,6 +537,10 @@ def recover_interrupted_executions() -> int:
             )
             changed += cur.rowcount
             if cur.rowcount:
+                _append_event(
+                    conn, execution_id=str(row["id"]), job_id=str(row["job_id"]),
+                    kind=EVENT_RECLAIMED, detail=reason,
+                )
                 record = _fetch(conn, row["id"])
                 if record is not None:
                     recovered.append(record)
@@ -435,6 +600,12 @@ def terminalize_dead_owner(execution_id: str, *, reason: str) -> bool:
         )
         if cur.rowcount != 1:
             return False
+        row = _fetch(conn, execution_id)
+        if row is not None:
+            _append_event(
+                conn, execution_id=execution_id, job_id=str(row["job_id"]),
+                kind=EVENT_RECLAIMED, detail=str(reason),
+            )
         record = _fetch(conn, execution_id)
         _prune_unlocked(conn)
     _emit_execution_state(record)
@@ -483,14 +654,19 @@ def latest_execution(job_id: str) -> Optional[Dict[str, Any]]:
 
 
 def live_inflight_execution(job_id: str) -> Optional[Dict[str, Any]]:
-    """The job's latest attempt while it is still claimed/running under a LIVE owner, else ``None``.
+    """The job's latest attempt while it is still claimed/running under a LIVE owner and an
+    unexpired lease, else ``None``.
 
     This is scheduler OWNERSHIP, not recent activity: a run inside a long tool call writes no
     heartbeat yet stays owned, while a run whose process died (watchdog kill, crash) does not.
+    An attempt whose explicit lease has lapsed is NEVER reported as running — even if a pid
+    reading still looks alive — because the ledger can no longer prove it holds the run.
     Read-only — unlike ``recover_interrupted_executions`` it never rewrites a row.
     """
     record = latest_execution(job_id)
     if not record or record.get("status") not in ("claimed", "running"):
+        return None
+    if execution_lease_expired(record):
         return None
     if not _owner_is_live(int(record["pid"]), record.get("process_started_at")):
         return None
@@ -518,3 +694,58 @@ def latest_executions(job_ids: List[str]) -> Dict[str, Dict[str, Any]]:
             clean,
         ).fetchall()
     return {row["job_id"]: dict(row) for row in rows}
+
+
+def execution_outcome(record: Optional[Dict[str, Any]]) -> str:
+    """The run's outcome in the frozen vocabulary: ``completed``, ``failed`` or ``unknown``.
+
+    Anything the ledger cannot prove — an interrupted/abandoned attempt, a missing finish record,
+    an expired claim, or an absent row — is ``unknown``. A still-in-flight attempt is ``unknown``
+    because it has not produced a provable outcome yet; its live ``status`` stays visible on the
+    record itself.
+    """
+    if not record:
+        return "unknown"
+    status = str(record.get("status") or "")
+    return status if status in ("completed", "failed") else "unknown"
+
+
+def renew_execution_lease(execution_id: str) -> bool:
+    """Push a live attempt's explicit lease forward by the shared ``FIRE_CLAIM_TTL_SECONDS``.
+
+    Called on heartbeat so a legitimately long run never reads as an expired lease. False when the
+    attempt is terminal or not owned by this process (never extend another owner's lease).
+    """
+    with _transaction() as conn:
+        cur = conn.execute(
+            "UPDATE executions SET lease_until=? WHERE id=? AND status IN ('claimed','running')"
+            " AND process_id=? AND pid=?",
+            (_lease_deadline(_hermes_now()), str(execution_id), _PROCESS_ID, os.getpid()),
+        )
+    return cur.rowcount == 1
+
+
+def list_execution_events(
+    *, execution_id: Optional[str] = None, job_id: Optional[str] = None, limit: int = 200,
+) -> List[Dict[str, Any]]:
+    """Append-only event trail, oldest-first, for one attempt or one job. Read-only.
+
+    The trail is the run's own history (claimed → started → finished/failed → delivered or
+    not_delivered, or reclaimed when the lease lapsed); it is never reconstructed from mutable
+    job-store fields and never rewritten after the fact.
+    """
+    clauses: List[str] = []
+    params: List[Any] = []
+    if execution_id is not None:
+        clauses.append("execution_id=?")
+        params.append(str(execution_id))
+    if job_id is not None:
+        clauses.append("job_id=?")
+        params.append(str(job_id))
+    where = " WHERE " + " AND ".join(clauses) if clauses else ""
+    params.append(max(1, min(int(limit), 1000)))
+    with _transaction() as conn:
+        rows = conn.execute(
+            "SELECT * FROM execution_events" + where + " ORDER BY id ASC LIMIT ?", params
+        ).fetchall()
+    return [dict(row) for row in rows]

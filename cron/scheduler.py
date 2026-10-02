@@ -3123,6 +3123,7 @@ def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_
             execution_id, success=False,
             error="Fire claim ownership lost before terminal completion.")
         return True
+    delivery_lane = _normalize_deliver_value(_delivery_lane_value(job, for_failure=not d.success))
     delivery_outcome = _classify_delivery_outcome(
         delivery_error=d.delivery_error,
         delivery_queued=job.get("last_delivery_queued"),
@@ -3130,7 +3131,7 @@ def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_
         should_deliver=d.should_deliver,
         unresolved_origin=d.unresolved_origin,
         # Read the lane the notice was actually routed through (failure_deliver on failure).
-        normalized_deliver=_normalize_deliver_value(_delivery_lane_value(job, for_failure=not d.success)),
+        normalized_deliver=delivery_lane,
         incident_acked=d.incident_acked,
         success=d.success,
     )
@@ -3138,7 +3139,11 @@ def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_
         # Failure ping left the process (or had a configured target): mark the incident alerted.
         _mark_incident_alerted(d.failure_incident_id)
     finish_execution(
-        execution_id, success=d.success, error=d.error, delivery_outcome=delivery_outcome)
+        execution_id, success=d.success, error=d.error, delivery_outcome=delivery_outcome,
+        # Bind the run's result to the real destination (the originating conversation/job lane);
+        # finish_execution records "none" when no destination was resolved.
+        delivery_target=delivery_lane if d.should_deliver else None,
+    )
     return True
 
 
