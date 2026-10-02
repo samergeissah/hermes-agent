@@ -132,6 +132,33 @@ def test_interrupted_attempt_with_a_fresh_lease_keeps_the_owner_gone_reason(
     assert recovered["error"] == executions._OWNER_GONE_REASON
 
 
+def test_fire_claim_heartbeat_renews_the_execution_lease(executions, temp_home, monkeypatch):
+    """The scheduler's heartbeat hook keeps the execution lease in lockstep with the fire claim.
+
+    Without it a run that legitimately outlives FIRE_CLAIM_TTL_SECONDS would read as an expired
+    lease and stop being reported as running.
+    """
+    import cron.scheduler as scheduler_mod
+    from cron.jobs import claim_job_for_fire, create_job
+
+    job = create_job(prompt="x", schedule="every 5m", name="heartbeat-lease")
+    assert claim_job_for_fire(job["id"]) is True
+    record = executions.create_execution(job["id"], source="builtin")
+    executions.mark_execution_running(record["id"])
+    issued = datetime.fromisoformat(executions.get_execution(record["id"])["lease_until"])
+
+    later = issued + timedelta(minutes=5)
+    monkeypatch.setattr(executions, "_hermes_now", lambda: later)
+    scheduler_mod._renew_execution_lease_best_effort(
+        {"id": job["id"], "execution_id": record["id"]}, job["id"]
+    )
+
+    renewed = executions.get_execution(record["id"])
+    assert datetime.fromisoformat(renewed["lease_until"]) > later
+    assert executions.execution_lease_expired(renewed) is False
+    assert executions.live_inflight_execution(job["id"]) is not None
+
+
 def test_legacy_row_without_a_lease_uses_the_shared_ttl(executions, monkeypatch):
     """A pre-lease row reads its lease from FIRE_CLAIM_TTL_SECONDS over claimed_at."""
     from cron.constants import FIRE_CLAIM_TTL_SECONDS
