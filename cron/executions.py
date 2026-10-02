@@ -418,23 +418,26 @@ def finish_execution(
 ) -> Optional[Dict[str, Any]]:
     """Write a terminal result once; terminal attempts cannot be rewritten.
 
-    ``delivery_outcome`` is normalised to the real state or ``none``; ``delivery_target`` is the
-    actual destination the result was bound to (the originating conversation/job lane) or ``none``.
-    Both are recorded as an append-only ``delivered``/``not_delivered`` event.
+    ``delivery_outcome`` is normalised to the real state or ``none``; the delivery destination is
+    the value already bound via ``set_delivery_target`` (or ``delivery_target`` here), and reads
+    back as ``none`` when no destination exists. Both are recorded as an append-only
+    ``delivered``/``not_delivered`` event.
     """
     now = _hermes_now().isoformat()
     status = "completed" if success else "failed"
     detail = None if success else (str(error) if error else "unknown failure")
     outcome = normalize_delivery_outcome(delivery_outcome)
-    target = str(delivery_target).strip() if delivery_target not in (None, "") else DELIVERY_NONE
+    target = str(delivery_target).strip() if delivery_target not in (None, "") else None
     with _transaction() as conn:
         cur = conn.execute(
             """UPDATE executions
                SET status=?, finished_at=?, error=?, handoff_pending=0,
-                   handoff_started_at=NULL, delivery_outcome=?, delivery_target=?
+                   handoff_started_at=NULL, delivery_outcome=?,
+                   delivery_target=COALESCE(?, delivery_target, ?)
                WHERE id=? AND status IN ('claimed','running')
                  AND process_id=? AND pid=?""",
-            (status, now, detail, outcome, target, execution_id, _PROCESS_ID, os.getpid()),
+            (status, now, detail, outcome, target, DELIVERY_NONE,
+             execution_id, _PROCESS_ID, os.getpid()),
         )
         if cur.rowcount != 1:
             return None
@@ -449,13 +452,32 @@ def finish_execution(
                 conn, execution_id=execution_id, job_id=str(row["job_id"]),
                 kind=(EVENT_DELIVERED if outcome in _DELIVERED_OUTCOMES
                       else EVENT_NOT_DELIVERED),
-                detail=outcome, target=target,
+                detail=outcome, target=row.get("delivery_target") or DELIVERY_NONE,
             )
         _prune_unlocked(conn)
         record = _fetch(conn, execution_id)
-    _emit_execution_state(record, delivery_outcome=outcome)
-    record_cron_finish(record, outcome)
+    # Monitoring keeps its existing semantics: the caller's raw outcome (None = "no delivery was
+    # attempted") decides skipped vs failed. The durable column records it as "none" instead.
+    _emit_execution_state(record, delivery_outcome=delivery_outcome)
+    record_cron_finish(record, delivery_outcome)
     return record
+
+
+def set_delivery_target(execution_id: str, target: Optional[str]) -> bool:
+    """Bind a live attempt's real delivery destination before it is finished.
+
+    The destination is the lane the result actually went to (the originating conversation/job
+    lane). False when the attempt is terminal or not owned by this process. Recorded, never
+    inferred: a later ``finish_execution`` writes ``none`` only when nothing was ever bound.
+    """
+    text = str(target).strip() if target not in (None, "") else None
+    with _transaction() as conn:
+        cur = conn.execute(
+            "UPDATE executions SET delivery_target=COALESCE(?, delivery_target) "
+            "WHERE id=? AND status IN ('claimed','running') AND process_id=? AND pid=?",
+            (text, str(execution_id), _PROCESS_ID, os.getpid()),
+        )
+    return cur.rowcount == 1
 
 
 _OWNER_GONE_REASON = (

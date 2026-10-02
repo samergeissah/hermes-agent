@@ -101,6 +101,23 @@ def test_missing_destination_is_recorded_as_none_not_as_delivered(executions):
     assert executions.normalize_delivery_outcome("queued") == "queued"
 
 
+def test_bound_destination_survives_the_terminal_write(executions):
+    """The scheduler binds the lane first; finish_execution must not overwrite it with 'none'."""
+    record = executions.create_execution("bound-target", source="builtin")
+    executions.mark_execution_running(record["id"])
+    assert executions.set_delivery_target(record["id"], "telegram:-100555") is True
+
+    finished = executions.finish_execution(
+        record["id"], success=True, delivery_outcome="delivered")
+
+    assert finished["delivery_target"] == "telegram:-100555"
+    delivered = [
+        event for event in executions.list_execution_events(execution_id=record["id"])
+        if event["kind"] == "delivered"
+    ]
+    assert delivered and delivered[-1]["target"] == "telegram:-100555"
+
+
 def test_outcome_vocabulary_is_frozen(executions):
     assert executions.EXECUTION_OUTCOMES == ("completed", "failed", "unknown")
     completed = executions.create_execution("done", source="builtin")
