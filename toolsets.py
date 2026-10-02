@@ -77,6 +77,13 @@ CLIENT_SURFACE_TOOLSETS = frozenset({"project", "desktop_ui"})
 TOOLSETS = {
     # Basic toolsets - individual tool categories
     "web": _ts("Web research and content extraction tools", ["web_search", "web_extract"]),
+    "research_readonly": _ts(
+        "Read-only research lane — single-page reads from an allowlisted canonical host "
+        "through a bearer-gated browser service, redirects refused, and an explicit "
+        "live-vs-sample flag: sample mode refuses rather than inventing an answer "
+        "(tools/research_lane.py). Off by default; enable in `hermes tools`.",
+        ["research_readonly"],
+    ),
     "search": _ts("Web search only (no content extraction/scraping)", ["web_search"]),
     "x_search": _ts(
         "Search X (Twitter) posts and threads via xAI's built-in x_search Responses "

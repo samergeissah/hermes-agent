@@ -330,6 +330,15 @@ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
     if not action:
         return json.dumps({"error": "missing `action`"})
     session_id = str(kwargs.get("session_id") or "")  # approval-state / daemon-mode isolation key
+    # Per-profile capability gate (ported from OpenDots' per-Dot computer service): every capability starts
+    # disabled and is checked before any device action; a refusal is audited and returned, never dispatched.
+    from tools.computer_use.profile_capabilities import ActionDenied, begin_action
+    try:
+        lease = begin_action(action, session_id)
+    except ActionDenied as e:
+        from tools.computer_use.audit import record_denied
+        record_denied(action, session_id, e.reason, args=args)
+        return json.dumps({"ok": False, "action": action, "code": "capability_denied", "error": e.reason})
     # Bot Desktop lease: while a human drives the screen every action, capture included, is refused.
     from tools.bot_desktop import lease as _bd_lease
     from tools.bot_desktop.runtime import ensure_started_for_tool as _bd_ensure_started
@@ -375,9 +384,15 @@ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
                         "A human took over this desktop while the action ran; its result was discarded. "
                         "Tell the user what you need and re-capture once they hand back.")
             _fence()  # input actions never receive fence=; refuse before the device op starts
-            result = _dispatch(backend, action, args, fence=_fence, session_id=session_id or None)
-            _fence()
-            return result
+            from tools.computer_use.audit import audit_action
+            with lease, audit_action(action, session_id, args, lease) as _rec:
+                lease.bind_backend(backend)
+                lease.check()  # a revoke between admission and dispatch refuses before the device op
+                result = _dispatch(backend, action, args, fence=_fence, session_id=session_id or None)
+                _fence()
+                _rec.assess(result)
+                lease.check()  # revoked in flight: raise so the result is discarded and audited as failed
+                return result
     except _bd_lease.HumanHasControl as e:
         return _refused(e)
     except Exception as e:

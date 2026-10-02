@@ -2242,16 +2242,45 @@ def _claim_owner_is_dead(claim: Dict[str, Any]) -> bool:
         return False
 
 
+def claim_lease_until(claim: Any) -> Optional[datetime]:
+    """The explicit lease deadline a claim carries, or ``None`` when it does not carry one.
+
+    New claims stamp ``lease_until`` at acquisition and every heartbeat refreshes it, so liveness
+    is read from the lease itself instead of being re-derived from the ``at`` stamp. Claims written
+    before ``lease_until`` existed return ``None`` and keep the age-based reading in
+    ``_claim_is_live`` (legacy records are never silently treated as expired)."""
+    if not isinstance(claim, dict):
+        return None
+    raw = claim.get("lease_until")
+    if not raw:
+        return None
+    return _parse_aware(raw)
+
+
 def _claim_is_live(claim: Any, now: datetime, ttl_seconds: float) -> bool:
-    """True for a well-formed claim aged within ``[0, ttl)`` whose owner is not provably dead:
-    future-dated (clock/TZ skew) or malformed claims count as stale so they can never wedge a
-    job, and a same-host owner pid that has exited releases the claim immediately instead of
-    after the TTL (a killed ``hermes cron run`` otherwise blocks the next manual run for the
-    full window with "already being fired")."""
+    """True for a well-formed claim whose explicit lease has not expired and whose owner is not
+    provably dead.
+
+    A claim that carries ``lease_until`` is live only while ``claimed_at <= now < lease_until``:
+    past the explicit deadline it is never reported live, whatever the owner pid says (a heartbeat
+    that keeps the run healthy refreshes both stamps). A future-dated (clock/TZ skew) or malformed
+    claim counts as stale so it can never wedge a job. A same-host owner pid that has exited
+    releases the claim immediately instead of after the TTL (a killed ``hermes cron run``
+    otherwise blocks the next manual run for the full window with "already being fired").
+
+    Legacy claims without ``lease_until`` keep the original age-in-``[0, ttl)`` reading, so the
+    explicit lease is additive rather than a reinterpretation of existing records."""
     if not isinstance(claim, dict) or not claim.get("at"):
         return False
     claimed_at = _parse_aware(claim["at"])
-    if claimed_at is None or not (0 <= _elapsed_seconds(now, claimed_at) < ttl_seconds):
+    if claimed_at is None or _elapsed_seconds(now, claimed_at) < 0:
+        return False
+    lease_until = claim_lease_until(claim)
+    if lease_until is not None and _elapsed_seconds(now, lease_until) >= 0:
+        return False  # explicit lease expired: not running, whatever the pid claims
+    # The caller's TTL still bounds the claim from its ``at`` stamp (a heartbeat refreshes both
+    # stamps together), so an explicit lease can never outlive the TTL window requested here.
+    if _elapsed_seconds(now, claimed_at) >= ttl_seconds:
         return False
     return not _claim_owner_is_dead(claim)
 
@@ -2638,11 +2667,21 @@ def claim_dispatch(job_id: str) -> bool:
     return claimed
 
 
-def _refresh_claim(jobs: List[Dict[str, Any]], claim: Any, expected_owner: str) -> bool:
-    """Compare-and-refresh a claim's ``at`` stamp; False unless *expected_owner* still holds it."""
+def _refresh_claim(
+    jobs: List[Dict[str, Any]], claim: Any, expected_owner: str,
+    *, ttl_seconds: Optional[float] = None,
+) -> bool:
+    """Compare-and-refresh a claim's ``at`` stamp; False unless *expected_owner* still holds it.
+
+    ``ttl_seconds`` (the same TTL the claim was acquired with) also pushes ``lease_until`` forward
+    so the explicit lease moves in lockstep with the ``at`` stamp: a healthy long run that
+    heartbeats never reads as an expired lease."""
     if not isinstance(claim, dict) or claim.get("by") != expected_owner:
         return False
-    claim["at"] = _hermes_now().isoformat()
+    now = _hermes_now()
+    claim["at"] = now.isoformat()
+    if ttl_seconds is not None:
+        claim["lease_until"] = (now + timedelta(seconds=ttl_seconds)).isoformat()
     save_jobs(jobs)
     return True
 
@@ -2660,7 +2699,9 @@ def heartbeat_run_claim(job_id: str, *, expected_owner: str) -> bool:
     def apply(jobs, _i, job):
         if job.get("schedule", {}).get("kind") != "once":
             return False
-        return _refresh_claim(jobs, job.get("run_claim"), expected_owner)
+        return _refresh_claim(
+            jobs, job.get("run_claim"), expected_owner,
+            ttl_seconds=_oneshot_run_claim_ttl_seconds())
 
     return _with_job(job_id, apply, False)
 
@@ -2787,7 +2828,13 @@ def claim_job_for_fire(
             _activate_job_record(job)
         # Per-acquisition token: a process may legitimately reclaim its own stale lease, and the
         # previous runner must not heartbeat the new claim merely because hostname + PID match.
-        job["fire_claim"] = {"at": now.isoformat(), "by": f"{_machine_id()}:{uuid.uuid4().hex}"}
+        job["fire_claim"] = {
+            "at": now.isoformat(),
+            "by": f"{_machine_id()}:{uuid.uuid4().hex}",
+            # Explicit lease, derived from the SAME FIRE_CLAIM_TTL_SECONDS the liveness check uses
+            # (heartbeat_fire_claim refreshes it); no second TTL is invented.
+            "lease_until": (now + timedelta(seconds=claim_ttl_seconds)).isoformat(),
+        }
         # Claimed: the occurrence is now owned by a run (its ledger row + fire claim carry it).
         job.pop("pending_slot", None)
         if job.get("schedule", {}).get("kind") in {"cron", "interval"}:
@@ -2807,7 +2854,9 @@ def heartbeat_fire_claim(job_id: str, *, expected_owner: str) -> bool:
     delivery, and the fence's reentrancy is per thread, so the heartbeat thread would time out and
     report a false ownership loss. ``_jobs_lock`` already serializes the compare-and-refresh."""
     def apply(jobs, _i, job):
-        return _refresh_claim(jobs, job.get("fire_claim"), expected_owner)
+        return _refresh_claim(
+            jobs, job.get("fire_claim"), expected_owner,
+            ttl_seconds=FIRE_CLAIM_TTL_SECONDS)
 
     return _with_job(job_id, apply, False)
 

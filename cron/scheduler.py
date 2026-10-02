@@ -543,7 +543,9 @@ from cron.jobs import (
 from cron.executions import (
     _TERMINAL_STATES, HANDOFF_ADOPTION_GRACE_SECONDS, create_execution, finish_execution,
     get_execution, mark_execution_handoff_pending, mark_execution_running,
-    recover_interrupted_executions, terminalize_dead_owner)
+    recover_interrupted_executions, renew_execution_lease,
+    set_delivery_target as bind_delivery_target,
+    terminalize_dead_owner)
 
 # Response marker that suppresses delivery (output is still saved locally for audit).
 SILENT_MARKER = "[SILENT]"
@@ -2641,6 +2643,23 @@ def _teardown_cron_agent(
         timeout_seconds=timeout_seconds)
 
 
+def _renew_execution_lease_best_effort(job: dict, job_id: str) -> None:
+    """Keep a live run's execution lease in lockstep with its fire claim.
+
+    The fire claim is the authority for ownership, so a ledger hiccup here must never fail the
+    heartbeat (that would falsely report a lost claim and interrupt a healthy run). Without this,
+    a run that legitimately outlives ``FIRE_CLAIM_TTL_SECONDS`` would read as an expired lease and
+    stop being reported as running.
+    """
+    execution_id = str(job.get("execution_id") or "")
+    if not execution_id:
+        return
+    try:
+        renew_execution_lease(execution_id)
+    except Exception:
+        logger.debug("Job '%s': execution lease renew failed", job_id, exc_info=True)
+
+
 def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
     """Run ``run`` while keeping this job's owned durable fire claim fresh."""
     claim = job.get("fire_claim")
@@ -2696,6 +2715,7 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
                         job_id)
                     return
                 last_confirmed = time.monotonic()
+                _renew_execution_lease_best_effort(job, job_id)
             except Exception:
                 logger.debug("Job '%s': fire_claim heartbeat failed", job_id, exc_info=True)
                 if (
@@ -3123,6 +3143,7 @@ def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_
             execution_id, success=False,
             error="Fire claim ownership lost before terminal completion.")
         return True
+    delivery_lane = _normalize_deliver_value(_delivery_lane_value(job, for_failure=not d.success))
     delivery_outcome = _classify_delivery_outcome(
         delivery_error=d.delivery_error,
         delivery_queued=job.get("last_delivery_queued"),
@@ -3130,13 +3151,17 @@ def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_
         should_deliver=d.should_deliver,
         unresolved_origin=d.unresolved_origin,
         # Read the lane the notice was actually routed through (failure_deliver on failure).
-        normalized_deliver=_normalize_deliver_value(_delivery_lane_value(job, for_failure=not d.success)),
+        normalized_deliver=delivery_lane,
         incident_acked=d.incident_acked,
         success=d.success,
     )
     if delivery_outcome in ("delivered", "not_configured") and not d.success:
         # Failure ping left the process (or had a configured target): mark the incident alerted.
         _mark_incident_alerted(d.failure_incident_id)
+    if d.should_deliver:
+        # Bind the run's result to the real destination (the originating conversation/job lane)
+        # before the terminal write; finish_execution records "none" when nothing was bound.
+        bind_delivery_target(execution_id, delivery_lane)
     finish_execution(
         execution_id, success=d.success, error=d.error, delivery_outcome=delivery_outcome)
     return True
