@@ -3086,6 +3086,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         second copy of it. A turn that fails again reaches the peer client exactly as before.
         """
         from tools.bot_failure_reasons import RETRY_NONE, result_retry_action
+        from gateway.platforms.api_server_openai_routes import _response_status
         gateway_session_key = ctx["gateway_session_key"]
         session_id = ctx["session_id"]
         history = await self._conversation_history_for_session(session_id)
